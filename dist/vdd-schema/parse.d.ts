@@ -17,7 +17,8 @@
  *     discriminator is missing/invalid, otherwise the chosen member's issues verbatim.
  *   - an optional field present-but-`undefined` is kept (`{key: undefined}`); absent is
  *     omitted; required-but-`undefined` is an error.
- *   - `record` values accept any non-array object and are copied shallowly.
+ *   - `record` inputs must pass zod's `isPlainObject` heuristic (constructor-chain,
+ *     see `isRecordInput`); accepted values are copied shallowly.
  *   - objects reject arrays, `null`, and non-objects; all issues are collected, not
  *     only the first.
  */

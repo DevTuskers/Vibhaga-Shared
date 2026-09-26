@@ -56,7 +56,13 @@ generated cases through both):
 - **one documented path-shape exception:** inside `meta`, an enumerable *symbol* key
   fails the record as zod's does, but `VddIssue.path` is `(string|number)[]`, so the
   symbol segment is emitted as `String(sym)` (e.g. `["meta","Symbol(x)"]`) rather than
-  the symbol itself.
+  the symbol itself;
+- **one deliberate behavioural divergence:** a field value whose `.length` is a
+  `Symbol` (e.g. `{"id": {"length": Symbol()}}`) makes zod's coerced `length >= min`
+  comparison **throw** a `TypeError` out of `safeParse`; this parser returns a normal
+  issue instead — a parser on a Worker request path must never throw. Both reject the
+  input; the differential suite encodes it as "oracle threw ⇒ parser returns
+  `ok: false`".
 
 Paint safety is **not** a schema rule: hostile colours parse fine (the figure must still
 draw) and are refused at the render boundary by `safeColor`/`safeCanvasBackground`;

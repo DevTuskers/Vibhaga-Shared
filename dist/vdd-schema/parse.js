@@ -17,7 +17,8 @@
  *     discriminator is missing/invalid, otherwise the chosen member's issues verbatim.
  *   - an optional field present-but-`undefined` is kept (`{key: undefined}`); absent is
  *     omitted; required-but-`undefined` is an error.
- *   - `record` values accept any non-array object and are copied shallowly.
+ *   - `record` inputs must pass zod's `isPlainObject` heuristic (constructor-chain,
+ *     see `isRecordInput`); accepted values are copied shallowly.
  *   - objects reject arrays, `null`, and non-objects; all issues are collected, not
  *     only the first.
  */
@@ -72,12 +73,18 @@ const num = (opts = {}) => (v, path, ctx) => {
 };
 const str = (opts = {}) => (v, path, ctx) => {
     if (typeof v !== "string") {
-        // zod's length check is "sizable"-gated, not type-gated: a non-string with a
-        // numeric `.length` violating the bound still earns the too_small issue on
-        // top of invalid_type (`id: []` → both; `id: 42` → invalid_type only).
+        // zod's min_length `when` gate is `!nullish(val) && val.length !== undefined`
+        // (no type check on `.length`) and the test is the COERCED `length >= minimum`
+        // — so `{length:"abc"|null|false|NaN|[]}` still earns too_small on top of
+        // invalid_type, while `{length:undefined}` and `42` earn invalid_type only.
         fail(ctx, path, "expected a string");
-        if (opts.minLen !== undefined && typeof v?.length === "number" && v.length < opts.minLen) {
-            fail(ctx, path, `expected a string of at least ${opts.minLen} characters`);
+        if (opts.minLen !== undefined) {
+            const len = v?.length;
+            // ONE deliberate divergence (README/AGENTS): a Symbol `.length` makes zod's
+            // `>=` throw TypeError; a parser on a request path must never throw — reject.
+            if (len !== undefined && (typeof len === "symbol" || !(len >= opts.minLen))) {
+                fail(ctx, path, `expected a string of at least ${opts.minLen} characters`);
+            }
         }
         return BAD;
     }
@@ -163,11 +170,14 @@ const tup = (items) => (v, path, ctx) => {
 };
 const arr = (item, min) => (v, path, ctx) => {
     if (!Array.isArray(v)) {
-        // same sizable-gated length check as zod: `"x"` (length 1) on `min(2)` gets
-        // invalid_type + too_small; `42` gets invalid_type only.
+        // same `when`-gated, coerced min_length check as `str` above: `"x"` (length 1)
+        // on `min(2)` gets invalid_type + too_small; `42` gets invalid_type only.
         fail(ctx, path, "expected an array");
-        if (min !== undefined && typeof v?.length === "number" && v.length < min) {
-            fail(ctx, path, `expected an array of at least ${min} items`);
+        if (min !== undefined) {
+            const len = v?.length;
+            if (len !== undefined && (typeof len === "symbol" || !(len >= min))) {
+                fail(ctx, path, `expected an array of at least ${min} items`);
+            }
         }
         return BAD;
     }
@@ -187,29 +197,50 @@ const arr = (item, min) => (v, path, ctx) => {
     return ok ? out : BAD;
 };
 /**
- * `record(string → unknown)`: zod 4 requires a *plain* object — proto `Object.prototype` or
- * `null` (Dates, class instances, Maps, arrays, functions all reject). Values are kept as-is;
- * zod iterates `Object.keys`, so only string-keyed own props survive the copy.
+ * `record(string → unknown)`: zod 4 requires a *plain* object — but "plain" is NOT a
+ * prototype-identity test. This is `util.isPlainObject` from `zod/v4/core/util.js`
+ * ported verbatim: it resolves `o.constructor` (own or INHERITED through the proto
+ * chain) — a delegate whose chain bottoms out at `Object.prototype` still passes
+ * (`Object.create({a:1})` accepts), while an own function-valued `constructor` whose
+ * `.prototype` lacks own `isPrototypeOf` fails (`{constructor: function(){}}` rejects).
+ * (`isPlainObjectInput` below mirrors zod's looser `isObject` — the gate `z.object`
+ * fields use — and is deliberately a different test.) Values are kept as-is; symbol
+ * keys reject, so only string-keyed own props survive the copy.
  */
-const isRecordInput = (v) => isPlainObjectInput(v) &&
-    (Object.getPrototypeOf(v) === Object.prototype || Object.getPrototypeOf(v) === null);
+const isRecordInput = (v) => {
+    if (!isPlainObjectInput(v))
+        return false; // zod `util.isObject`
+    const ctor = v.constructor;
+    if (ctor === undefined)
+        return true;
+    if (typeof ctor !== "function")
+        return true;
+    const prot = ctor.prototype;
+    if (!isPlainObjectInput(prot))
+        return false;
+    return Object.prototype.hasOwnProperty.call(prot, "isPrototypeOf");
+};
 const rec = (v, path, ctx) => {
     if (!isRecordInput(v))
         return fail(ctx, path, "expected a record (plain object)");
-    // zod's record runs every enumerable own KEY through the string() key schema:
-    // an enumerable symbol key fails it and voids the record (`invalid_key` at
-    // [.., <symbol>]). `VddIssue.path` is `(string|number)[]`, so the symbol path
-    // segment is emitted as `String(sym)` — e.g. "Symbol(s)" — documented because
-    // it is the one path segment that is not a real property key.
+    // zod's record iterates Reflect.ownKeys and runs EVERY enumerable own key through
+    // the string() key schema, CONTINUING past failures — so N enumerable symbol keys
+    // earn N `invalid_key` issues at [.., <symbol>]. `VddIssue.path` is
+    // `(string|number)[]`, so a symbol path segment is emitted as `String(sym)` —
+    // e.g. "Symbol(s)" — documented because it is the one path segment that is not a
+    // real property key.
+    let badKey = false;
     for (const sym of Object.getOwnPropertySymbols(v)) {
         if (Object.getOwnPropertyDescriptor(v, sym).enumerable) {
             ctx.issues.push({
                 path: [...path, String(sym)],
                 message: `${dotted(path, ctx.root)}: symbol keys are not allowed in a record`,
             });
-            return BAD;
+            badKey = true;
         }
     }
+    if (badKey)
+        return BAD;
     // zod's copy drops `__proto__` wholesale (an own `__proto__` key on the input — only
     // producible via JSON.parse — survives into neither the output's own keys nor its
     // prototype), keeps every other string key, and keeps values by reference.

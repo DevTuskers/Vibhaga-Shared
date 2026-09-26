@@ -41,6 +41,28 @@ const mismatches: Mismatch[] = [];
 const counts = { doc: 0, element: 0, accepted: 0, rejected: 0 };
 
 /**
+ * Snapshot for dedup keys and the non-mutation check. Plain `JSON.stringify` throws
+ * on bigint and mangles symbols/functions — corpus entries now include all three —
+ * so they're rendered explicitly instead.
+ */
+const snap = (v: unknown): string => {
+  try {
+    return (
+      JSON.stringify(v, (_k, x) =>
+        typeof x === "bigint"
+          ? `bigint:${x.toString()}`
+          : typeof x === "symbol"
+            ? String(x)
+            : typeof x === "function"
+              ? "<fn>"
+              : x) ?? "<undefined>"
+    );
+  } catch {
+    return "<unstringifiable>";
+  }
+};
+
+/**
  * Multiset of issue paths, JSON-encoded and sorted. Symbol path segments (which zod
  * emits verbatim inside `meta` record failures) are normalized to `String(sym)` so
  * they compare against the parser's documented `String(sym)` emission.
@@ -50,15 +72,34 @@ const pathMultiset = (issues: readonly { path: readonly PropertyKey[] }[]): stri
     .map((i) => JSON.stringify(i.path.map((s) => (typeof s === "symbol" ? String(s) : s))))
     .sort();
 
+type OracleOut = {
+  success: boolean;
+  data?: unknown;
+  error?: { issues: readonly { path: readonly PropertyKey[] }[] };
+};
+
 function compare<T>(
   label: string,
   mine: VddResult<T>,
-  oracle: { success: boolean; data?: unknown; error?: { issues: readonly { path: readonly PropertyKey[] }[] } },
+  oracle: OracleOut | "THREW",
   inputSnapshot: string,
   raw: unknown,
 ): void {
-  if (JSON.stringify(raw) !== inputSnapshot) {
+  if (snap(raw) !== inputSnapshot) {
     mismatches.push({ label, kind: "mutated", detail: "input changed by parsing" });
+  }
+  if (oracle === "THREW") {
+    // The ONE deliberate divergence (README/AGENTS): zod's coerced `length >= min`
+    // throws TypeError on a Symbol `.length`. A parser on a request path must never
+    // throw — the contract is "oracle threw ⇒ the parser still rejects".
+    if (mine.ok) {
+      mismatches.push({
+        label,
+        kind: "verdict",
+        detail: `oracle threw; parser must still reject input=${inputSnapshot.slice(0, 300)}`,
+      });
+    }
+    return;
   }
   if (mine.ok !== oracle.success) {
     mismatches.push({
@@ -93,19 +134,43 @@ function compare<T>(
 
 function checkDoc(raw: unknown, label: string): void {
   counts.doc++;
-  const snap = JSON.stringify(raw);
-  const mine = parseVddDocument(raw);
-  const oracle = OracleDocument.safeParse(raw);
+  const before = snap(raw);
+  let mine: ReturnType<typeof parseVddDocument>;
+  try {
+    mine = parseVddDocument(raw);
+  } catch (err) {
+    // The parser must never throw on a request path — a throw is a mismatch
+    // regardless of what the oracle does.
+    mismatches.push({ label, kind: "verdict", detail: `PARSER THREW: ${String(err).slice(0, 200)}` });
+    return;
+  }
+  let oracle: OracleOut | "THREW";
+  try {
+    oracle = OracleDocument.safeParse(raw) as OracleOut;
+  } catch {
+    oracle = "THREW";
+  }
   (mine.ok ? counts.accepted++ : counts.rejected++);
-  compare(label, mine, oracle, snap, raw);
+  compare(label, mine, oracle, before, raw);
 }
 
 function checkElement(raw: unknown, label: string): void {
   counts.element++;
-  const snap = JSON.stringify(raw);
-  const mine = parseVddElement(raw);
-  const oracle = OracleElement.safeParse(raw);
-  compare(label, mine, oracle, snap, raw);
+  const before = snap(raw);
+  let mine: ReturnType<typeof parseVddElement>;
+  try {
+    mine = parseVddElement(raw);
+  } catch (err) {
+    mismatches.push({ label, kind: "verdict", detail: `PARSER THREW: ${String(err).slice(0, 200)}` });
+    return;
+  }
+  let oracle: OracleOut | "THREW";
+  try {
+    oracle = OracleElement.safeParse(raw) as OracleOut;
+  } catch {
+    oracle = "THREW";
+  }
+  compare(label, mine, oracle, before, raw);
 }
 
 /** Element mutant inside a minimal valid doc, so document paths are exercised too. */
@@ -145,7 +210,7 @@ const delPath = (obj: any, path: readonly (string | number)[]): any => {
 const seenDoc = new Set<string>();
 const docCases: [string, unknown][] = [];
 const addDoc = (label: string, doc: unknown): void => {
-  const key = JSON.stringify(doc) ?? "<unstringifiable>";
+  const key = snap(doc);
   if (seenDoc.has(key)) return;
   seenDoc.add(key);
   docCases.push([label, doc]);
@@ -156,7 +221,7 @@ const addDoc = (label: string, doc: unknown): void => {
 const seenEl = new Set<string>();
 const elCases: [string, unknown][] = [];
 const addEl = (label: string, el: unknown): void => {
-  const key = JSON.stringify(el) ?? "<unstringifiable>";
+  const key = snap(el);
   if (seenEl.has(key)) return;
   seenEl.add(key);
   elCases.push([label, el]);
@@ -536,6 +601,67 @@ describe("differential: package parser vs Admin zod oracle", () => {
         elements: [{ id: "e", type: "circle", center: [0, 0], r: 1, junk: 1 }],
       }));
     }
+
+    /* ── critique R2 case classes (F7–F9) ─────────────────────────────────────
+     * Ported from wt/shared-vdd/critique/minimal-repros-r2.mts: the sizable-gated
+     * min_length check is `when`-gated on `length !== undefined` (NOT typeof) with
+     * the coerced `length >= min` comparison; record inputs use zod's constructor-
+     * chain isPlainObject heuristic; each enumerable symbol key is its own issue.
+     * Proto/delegate/ctor cases push directly — a JSON dedup key cannot tell a
+     * delegate proto from a literal and would silently drop them. */
+
+    // F7: non-number `.length` on min-gated slots — id (minLen 1), points (min 2/3)
+    for (const [tag, len] of [
+      ["str", "abc"], ["str-num", "0"], ["null", null], ["false", false], ["true", true],
+      ["bigint0", 0n], ["bigint2", 2n], ["nan", NaN], ["empty-arr", []], ["arr9", [9]],
+      ["obj", {}], ["undef", undefined],
+    ] as const) {
+      addEl(`r6:id.length=${tag}`, { id: { length: len }, type: "circle", center: [0, 0], r: 1 });
+    }
+    // the documented divergence: Symbol `.length` makes the ORACLE throw; the
+    // parser must still reject (compare() special-cases "oracle threw ⇒ ok:false")
+    addEl("r6:id.length=Symbol", { id: { length: Symbol("L") }, type: "circle", center: [0, 0], r: 1 });
+    for (const [tag, len] of [
+      ["str", "abc"], ["str-1", "1"], ["null", null], ["false", false],
+      ["bigint1", 1n], ["nan", NaN], ["empty-arr", []], ["arr5", [5]],
+    ] as const) {
+      addEl(`r6:polyline.points.length=${tag}`, { id: "e", type: "polyline", points: { length: len } });
+      addEl(`r6:polygon.points.length=${tag}`, { id: "e", type: "polygon", points: { length: len } });
+    }
+    // inherited / getter `.length` — the `when` gate reads `val.length` normally
+    elCases.push(["r6:id.proto-length0", { id: Object.create({ length: 0 }), type: "circle", center: [0, 0], r: 1 }]);
+    elCases.push(["r6:id.getter-length", { id: { get length() { return "x"; } }, type: "circle", center: [0, 0], r: 1 }]);
+    // tuple non-array: zod emits invalid_type ONLY — tuples have no sizable gate
+    for (const v of ["x", "ab", "abc", { length: 0 }, { length: 2 }, { length: 5 }]) {
+      addEl(`r6:point.at=${JSON.stringify(v)}`, { id: "e", type: "point", at: v });
+      addEl(`r6:line.points=${JSON.stringify(v)}`, { id: "e", type: "line", points: v });
+    }
+
+    // F8: record input gate — zod util.isPlainObject resolves `o.constructor`
+    // through the proto chain (delegates can pass; own ctor overrides can fail)
+    const metaDoc = (meta: unknown): Record<string, unknown> => ({
+      schema: "vibhaga.diagram", schemaVersion: 1,
+      canvas: { width: 1, height: 1 }, elements: [], meta,
+    });
+    docCases.push(["r7:meta-delegate-proto", metaDoc(Object.create({ a: 1 }))]);
+    docCases.push(["r7:meta-delegate-empty", metaDoc(Object.create({}))]);
+    docCases.push(["r7:meta-own-ctor-fn", metaDoc({ constructor: function () {}, a: 1 })]);
+    docCases.push(["r7:meta-own-ctor-42", metaDoc({ constructor: 42, a: 1 })]);
+    docCases.push(["r7:meta-own-ctor-null", metaDoc({ constructor: null, a: 1 })]);
+    docCases.push(["r7:meta-own-ctor-undef", metaDoc({ constructor: undefined, a: 1 })]);
+    docCases.push(["r7:meta-proto-isPrototypeOf", metaDoc(Object.create({ isPrototypeOf() {}, x: 1 }))]);
+    class MetaClass { a = 1; }
+    // a class METHOD lands on the prototype as an own (non-enumerable) property —
+    // exactly what flips zod's isPlainObject check to "accept"
+    class MetaClassIso { a = 1; isPrototypeOf(): boolean { return true; } }
+    docCases.push(["r7:meta-class-instance", metaDoc(new MetaClass())]);
+    docCases.push(["r7:meta-class-own-isPrototypeOf", metaDoc(new MetaClassIso())]);
+    docCases.push(["r7:meta-proxy", metaDoc(new Proxy({ a: 1 }, {}))]);
+    docCases.push(["r7:meta-map", metaDoc(new Map([["a", 1]]))]);
+    // F9: every enumerable symbol key earns its own invalid_key issue
+    docCases.push(["r7:meta-2-symbols", metaDoc({ [Symbol("a")]: 1, [Symbol("b")]: 2, c: 3 })]);
+    docCases.push(["r7:meta-3-symbols", metaDoc({ [Symbol("a")]: 1, [Symbol("b")]: 2, [Symbol("c")]: 3 })]);
+    docCases.push(["r7:meta-anon-symbol", metaDoc({ [Symbol()]: 1 })]);
 
     for (const [label, doc] of docCases) checkDoc(doc, `doc:${label}`);
     for (const [label, el] of elCases) {

@@ -31,3 +31,8 @@ The zod oracle is the spec made executable. If `parse.ts` and the oracle disagre
 parser is wrong unless the schema is *deliberately* changing — in which case update
 the oracle file first and say so in the commit. Keep the oracle's header sha honest
 when refreshing it.
+
+The ONE allowed divergence is named in the README: where zod *throws* (a `Symbol`
+`.length` on a min-gated field makes its coerced `length >= min` throw `TypeError`),
+the parser must still reject with issues — never throw, because it runs on a Worker
+request path. The differential suite encodes this as "oracle threw ⇒ `ok: false`".
