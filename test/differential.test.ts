@@ -1,0 +1,425 @@
+/**
+ * THE EQUIVALENCE PROOF. Every fixture and every generated mutant is run through BOTH the
+ * hand-rolled parser (`src/vdd-schema/parse.ts`) and the test oracle — the byte-verbatim
+ * copy of Admin's zod schema (`test/oracle/admin-vdd-zod.ts`, zod 4.4.3). For every input:
+ *
+ *   1. accept/reject parity:           `result.ok === oracle.success`
+ *   2. on success, value equality:     `deepStrictEqual(result.value, oracle.data)`
+ *      (unknown keys stripped at every level, `meta` kept as-is, new object not the input)
+ *   3. on failure, path-set equality:  the SET of issue paths is identical (messages may
+ *      differ — except PATH_D's, asserted verbatim in parse.test.ts)
+ *   4. non-mutation:                   the input is byte-identical after parsing
+ *
+ * All four must hold for 100% of cases. The suite is deterministic — no randomness at all.
+ */
+
+import { describe, expect, it } from "vitest";
+
+declare const console: { info(...args: unknown[]): void };
+
+import { VddDocument as OracleDocument, VddElement as OracleElement } from "./oracle/admin-vdd-zod.js";
+import {
+  parseVddDocument,
+  parseVddElement,
+  type VddResult,
+} from "../src/vdd-schema/index.js";
+import { GOLDEN_FIXTURES } from "./fixtures/golden.js";
+import { ELEMENT_EXEMPLARS, SEED_DOCS } from "./fixtures/corpus.js";
+import { VDD_FIELD_VECTORS } from "./fixtures/vddFieldVectors.js";
+
+/* ── mismatch reporting ─────────────────────────────────────────────────────── */
+
+type Mismatch = {
+  label: string;
+  kind: "verdict" | "value" | "paths" | "mutated";
+  detail: string;
+};
+
+const mismatches: Mismatch[] = [];
+const counts = { doc: 0, element: 0, accepted: 0, rejected: 0 };
+
+const pathSet = (issues: readonly { path: readonly PropertyKey[] }[]): Set<string> =>
+  new Set(issues.map((i) => JSON.stringify(i.path)));
+
+const setEq = (a: Set<string>, b: Set<string>): boolean =>
+  a.size === b.size && [...a].every((x) => b.has(x));
+
+function compare<T>(
+  label: string,
+  mine: VddResult<T>,
+  oracle: { success: boolean; data?: unknown; error?: { issues: readonly { path: readonly PropertyKey[] }[] } },
+  inputSnapshot: string,
+  raw: unknown,
+): void {
+  if (JSON.stringify(raw) !== inputSnapshot) {
+    mismatches.push({ label, kind: "mutated", detail: "input changed by parsing" });
+  }
+  if (mine.ok !== oracle.success) {
+    mismatches.push({
+      label,
+      kind: "verdict",
+      detail: `mine.ok=${mine.ok} oracle.success=${oracle.success} input=${inputSnapshot.slice(0, 400)}`,
+    });
+    return;
+  }
+  if (mine.ok) {
+    try {
+      expect(mine.value).toStrictEqual(oracle.data);
+    } catch (err) {
+      mismatches.push({
+        label,
+        kind: "value",
+        detail: `${(err as Error).message.slice(0, 600)} input=${inputSnapshot.slice(0, 300)}`,
+      });
+    }
+  } else {
+    const mp = pathSet(mine.errors);
+    const op = pathSet(oracle.error!.issues);
+    if (!setEq(mp, op)) {
+      mismatches.push({
+        label,
+        kind: "paths",
+        detail: `mine=${JSON.stringify([...mp].sort())} oracle=${JSON.stringify([...op].sort())} input=${inputSnapshot.slice(0, 300)}`,
+      });
+    }
+  }
+}
+
+function checkDoc(raw: unknown, label: string): void {
+  counts.doc++;
+  const snap = JSON.stringify(raw);
+  const mine = parseVddDocument(raw);
+  const oracle = OracleDocument.safeParse(raw);
+  (mine.ok ? counts.accepted++ : counts.rejected++);
+  compare(label, mine, oracle, snap, raw);
+}
+
+function checkElement(raw: unknown, label: string): void {
+  counts.element++;
+  const snap = JSON.stringify(raw);
+  const mine = parseVddElement(raw);
+  const oracle = OracleElement.safeParse(raw);
+  compare(label, mine, oracle, snap, raw);
+}
+
+/** Element mutant inside a minimal valid doc, so document paths are exercised too. */
+const wrap = (el: unknown): Record<string, unknown> => ({
+  schema: "vibhaga.diagram",
+  schemaVersion: 1,
+  canvas: { width: 400, height: 300 },
+  elements: [el],
+});
+
+/* ── immutable path helpers (mutant construction never shares structure edits) ── */
+
+const setPath = (obj: any, path: readonly (string | number)[], val: unknown): any => {
+  if (path.length === 0) return val;
+  const [head, ...rest] = path;
+  const src = obj !== null && typeof obj === "object" ? obj : {};
+  const copy: any = Array.isArray(src) ? src.slice() : { ...src };
+  copy[head] = setPath(src[head], rest, val);
+  return copy;
+};
+
+const delPath = (obj: any, path: readonly (string | number)[]): any => {
+  const [head, ...rest] = path;
+  const src = obj !== null && typeof obj === "object" ? obj : {};
+  const copy: any = Array.isArray(src) ? src.slice() : { ...src };
+  if (rest.length === 0) {
+    if (Array.isArray(copy)) copy.splice(Number(head), 1);
+    else delete copy[head];
+  } else {
+    copy[head] = delPath(src[head], rest);
+  }
+  return copy;
+};
+
+/* ── document corpus ────────────────────────────────────────────────────────── */
+
+const seenDoc = new Set<string>();
+const docCases: [string, unknown][] = [];
+const addDoc = (label: string, doc: unknown): void => {
+  const key = JSON.stringify(doc) ?? "<unstringifiable>";
+  if (seenDoc.has(key)) return;
+  seenDoc.add(key);
+  docCases.push([label, doc]);
+};
+
+/* ── element corpus + mutants ───────────────────────────────────────────────── */
+
+const seenEl = new Set<string>();
+const elCases: [string, unknown][] = [];
+const addEl = (label: string, el: unknown): void => {
+  const key = JSON.stringify(el) ?? "<unstringifiable>";
+  if (seenEl.has(key)) return;
+  seenEl.add(key);
+  elCases.push([label, el]);
+};
+
+const WRONG_TYPES: unknown[] = ["x", 42, true, null, [], {}, undefined, () => 0];
+const NUMERIC_BAD: unknown[] = [NaN, Infinity, -Infinity, -1, 0.5, 2 ** 53];
+
+/** Domain-specific bad (and a few boundary-good) values per element type + field. */
+const FIELD_EXTRA: Record<string, Record<string, unknown[]>> = {
+  "*": {
+    id: ["", 5, null],
+    type: ["bogus", "RECT", 5, null],
+    z: [1.5, 2 ** 53, -0.5],
+    rotation: [NaN, Infinity, "10"],
+    opacity: [2, -0.1, NaN, "0.5"],
+    groupId: [5, null],
+    stroke: ["x", 5, [], null],
+    fill: [null, [], "red"],
+    link: ["x", { refType: 5 }, { refId: null }, []],
+  },
+  rect: { rx: [NaN, -1], x: [NaN], y: [Infinity] },
+  circle: { r: [-1, NaN, 0], center: [[0], [0, 0, 0], ["x", 0], [0, NaN], "x"] },
+  ellipse: { rx: [-1], ry: [-1, NaN] },
+  line: { points: [[], [[0, 0]], [[0, 0], [1, 1], [2, 2]], [["x", 0], [1, 1]], [[0], [1, 1]]] },
+  polyline: { points: [[], [[0, 0]], [[0, 0], ["x", 0]], [[0, 0], [1]]] },
+  polygon: { points: [[], [[0, 0]], [[0, 0], [1, 1]], [[0, 0], [1, "x"], [2, 2]]] },
+  arrow: {
+    head: ["bogus", 5, "END"],
+    headSize: [NaN, -3],
+    points: [[], [[0, 0]], [[0, 0], [1, "x"]]],
+  },
+  point: {
+    at: [[0], [0, 0, 0], ["x", 0], [NaN, 0]],
+    r: [NaN, -1],
+    label: [5],
+    labelOffset: [[0], [0, 0, 0], ["x", 0]],
+  },
+  arc: { r: [-1], start: [NaN], end: [Infinity], sweep: ["bogus", 5, "CW"] },
+  path: {
+    d: [
+      "M 0 0 X 5",
+      "M0T5",
+      "M0 0 L1 1 R2 2",
+      "m 0 0 l 5 5", // relative commands are NOT in the whitelist
+      "M 0 0 ↔ L 1 1",
+      42,
+      null,
+      "",
+    ],
+  },
+  angleMark: {
+    arcs: [0, -2, 1.5, 2 ** 53],
+    variant: ["bogus", 5],
+    reflex: ["yes", 1, 0],
+    r: [-1, 0],
+    vertex: [[0], ["x", 0]],
+    from: [[0, 0, 0]],
+    to: [[NaN, 0]],
+  },
+  tickMark: {
+    count: [0, -1, 1.5],
+    at: [1.1, -0.1, NaN],
+    size: [NaN],
+    on: [[], [[0, 0]], [[0, 0], [1, 1], [2, 2]], [[0], [1, 1]]],
+  },
+  parallelMark: {
+    count: [0, -1, 1.5],
+    at: [1.1, -0.1],
+    on: [[], [[0, 0]]],
+  },
+  text: {
+    fontFamily: ["Comic Sans", 5, "SANS"],
+    align: ["bogus", 5],
+    baseline: ["bogus", "middle "],
+    fontSize: [NaN, -4],
+    color: [5, null],
+    value: [5, null],
+    at: [["x", 0], [0], [0, 0, 0]],
+  },
+  math: {
+    align: ["bogus"],
+    baseline: ["bogus"],
+    fontSize: [NaN],
+    color: [5],
+    latex: [5, null],
+    at: [[NaN, 0]],
+  },
+};
+
+function elementMutants(el: Record<string, unknown>, label: string): void {
+  const type = typeof el.type === "string" ? el.type : "";
+  const extras = { ...FIELD_EXTRA["*"], ...(FIELD_EXTRA[type] ?? {}) };
+
+  for (const key of Object.keys(el)) {
+    addEl(`${label}:del ${key}`, delPath(el, [key]));
+    for (const [i, v] of WRONG_TYPES.entries()) {
+      addEl(`${label}:${key}=wrong#${i}`, setPath(el, [key], v));
+    }
+    const value = el[key];
+    if (typeof value === "number") {
+      for (const [i, v] of NUMERIC_BAD.entries()) {
+        addEl(`${label}:${key}=num#${i}`, setPath(el, [key], v));
+      }
+    }
+    if (Array.isArray(value)) {
+      if (value.every((p) => typeof p === "number")) {
+        // a point tuple
+        addEl(`${label}:${key} short`, setPath(el, [key], value.slice(0, -1)));
+        addEl(`${label}:${key} long`, setPath(el, [key], [...value, 0]));
+        addEl(`${label}:${key} stritem`, setPath(el, [key], ["x", 0]));
+        addEl(`${label}:${key} nanitem`, setPath(el, [key], [NaN, 0]));
+      } else if (value.every((p) => Array.isArray(p))) {
+        // a point list
+        addEl(`${label}:${key} empty`, setPath(el, [key], []));
+        addEl(`${label}:${key} one`, setPath(el, [key], value.slice(0, 1)));
+        addEl(`${label}:${key} baditem`, setPath(el, [key], [...value.slice(0, -1), "x"]));
+        addEl(`${label}:${key} badinner`, setPath(el, [key], [...value.slice(0, -1), [1]]));
+      }
+    }
+    if (value !== null && typeof value === "object" && !Array.isArray(value)) {
+      for (const sub of Object.keys(value as Record<string, unknown>)) {
+        addEl(`${label}:${key}.${sub} del`, delPath(el, [key, sub]));
+        addEl(`${label}:${key}.${sub} str`, setPath(el, [key, sub], "x"));
+        addEl(`${label}:${key}.${sub} num`, setPath(el, [key, sub], 42));
+        addEl(`${label}:${key}.${sub} null`, setPath(el, [key, sub], null));
+        addEl(`${label}:${key}.${sub} junk`, setPath(el, [key, sub], { junk: 1 }));
+      }
+      addEl(`${label}:${key} junkkey`, setPath(el, [key], { ...(value as object), junk: 1 }));
+    }
+    for (const [i, v] of (extras[key] ?? []).entries()) {
+      addEl(`${label}:${key}=extra#${i}`, setPath(el, [key], v));
+    }
+  }
+  addEl(`${label}:+unknown`, { ...el, unknownExtra: { deep: [1] } });
+  addEl(`${label}:nonobj`, "not-an-element");
+  addEl(`${label}:arr`, [1, 2]);
+  // composed: several fields wrong at once — issue aggregation across fields
+  const keys = Object.keys(el);
+  if (keys.length >= 3) {
+    addEl(
+      `${label}:multi-bad`,
+      setPath(setPath(setPath(el, [keys[1]!], "x"), [keys[2]!], NaN), [keys[3] ?? keys[0]!], null),
+    );
+  }
+  addEl(`${label}:no-type-no-id`, delPath(delPath(el, ["type"]), ["id"]));
+}
+
+/* ── document mutants ───────────────────────────────────────────────────────── */
+
+function docMutants(doc: Record<string, unknown>, label: string): void {
+  for (const key of Object.keys(doc)) {
+    addDoc(`${label}:del ${key}`, delPath(doc, [key]));
+    for (const [i, v] of WRONG_TYPES.entries()) {
+      addDoc(`${label}:${key}=wrong#${i}`, setPath(doc, [key], v));
+    }
+    const value = doc[key];
+    if (value !== null && typeof value === "object" && !Array.isArray(value)) {
+      for (const sub of Object.keys(value as Record<string, unknown>)) {
+        addDoc(`${label}:${key}.${sub} del`, delPath(doc, [key, sub]));
+        addDoc(`${label}:${key}.${sub} str`, setPath(doc, [key, sub], "x"));
+        addDoc(`${label}:${key}.${sub} num`, setPath(doc, [key, sub], 42));
+        addDoc(`${label}:${key}.${sub} null`, setPath(doc, [key, sub], null));
+      }
+      addDoc(`${label}:${key} junkkey`, setPath(doc, [key], { ...(value as object), junk: 1 }));
+    }
+  }
+  addDoc(`${label}:+unknown`, { ...doc, extraTop: { a: 1 } });
+  addDoc(`${label}:schemaVersion=1.5`, setPath(doc, ["schemaVersion"], 1.5));
+  addDoc(`${label}:schemaVersion="1"`, setPath(doc, ["schemaVersion"], "1"));
+  addDoc(`${label}:schemaVersion=NaN`, setPath(doc, ["schemaVersion"], NaN));
+  addDoc(`${label}:schemaVersion=2^53`, setPath(doc, ["schemaVersion"], 2 ** 53));
+  addDoc(`${label}:canvas.width=0`, setPath(doc, ["canvas", "width"], 0));
+  addDoc(`${label}:canvas.width=-1`, setPath(doc, ["canvas", "width"], -1));
+  addDoc(`${label}:canvas.width=NaN`, setPath(doc, ["canvas", "width"], NaN));
+  addDoc(`${label}:canvas.height=0`, setPath(doc, ["canvas", "height"], 0));
+  addDoc(`${label}:canvas.bg=42`, setPath(doc, ["canvas", "background"], 42));
+  addDoc(`${label}:defaults.fontFamily=Comic Sans`, setPath(doc, ["defaults", "fontFamily"], "Comic Sans"));
+  addDoc(`${label}:defaults.strokeStyle=bogus`, setPath(doc, ["defaults", "strokeStyle"], "bogus"));
+  addDoc(`${label}:defaults.opacity=2`, setPath(doc, ["defaults", "opacity"], 2));
+  addDoc(`${label}:defaults.opacity=-0.5`, setPath(doc, ["defaults", "opacity"], -0.5));
+  addDoc(`${label}:meta=string`, setPath(doc, ["meta"], "x"));
+  addDoc(`${label}:meta=array`, setPath(doc, ["meta"], []));
+  addDoc(`${label}:meta=Date`, setPath(doc, ["meta"], new Date(0)));
+  addDoc(`${label}:meta=undefkey`, setPath(doc, ["meta"], { a: undefined }));
+  // `__proto__` as an own data property — reachable only via JSON.parse, never a literal.
+  addDoc(`${label}:meta=protokey`, setPath(doc, ["meta"], JSON.parse('{"__proto__":{"x":1}}')));
+  addDoc(`${label}:schemaVersion=-1`, setPath(doc, ["schemaVersion"], -1));
+  addDoc(`${label}:schemaVersion=0`, setPath(doc, ["schemaVersion"], 0));
+  addDoc(`${label}:schemaVersion=MAX_SAFE`, setPath(doc, ["schemaVersion"], Number.MAX_SAFE_INTEGER));
+  addDoc(
+    `${label}:elements=[multi-bad]`,
+    setPath(doc, ["elements"], [{ id: "a" }, { type: "bogus" }, { id: "e", type: "circle", center: [0, 0], r: 1 }]),
+  );
+  addDoc(`${label}:a11y=string`, setPath(doc, ["a11y"], "x"));
+  addDoc(`${label}:a11y.title=42`, setPath(doc, ["a11y", "title"], 42));
+  addDoc(`${label}:elements=obj`, setPath(doc, ["elements"], {}));
+  addDoc(`${label}:elements=[5]`, setPath(doc, ["elements"], [5]));
+  addDoc(`${label}:elements=[null]`, setPath(doc, ["elements"], [null]));
+  addDoc(`${label}:elements=[[]]`, setPath(doc, ["elements"], [[]]));
+  addDoc(`${label}:elements=[{}]`, setPath(doc, ["elements"], [{}]));
+  addDoc(`${label}:elements=[bogus-type]`, setPath(doc, ["elements"], [{ id: "e", type: "bogus" }]));
+  addDoc(`${label}:elements=[type=5]`, setPath(doc, ["elements"], [{ id: "e", type: 5 }]));
+  addDoc(`${label}:elements=[undef]`, setPath(doc, ["elements"], [undefined]));
+}
+
+/* ── the suite ──────────────────────────────────────────────────────────────── */
+
+describe("differential: package parser vs Admin zod oracle", () => {
+  it("verdict, output value, error-path set and non-mutation agree on every case", () => {
+    // seeds: every fixture document
+    for (const [name, doc] of Object.entries(GOLDEN_FIXTURES)) {
+      addDoc(`golden:${name}`, doc);
+      docMutants(doc as unknown as Record<string, unknown>, `golden:${name}`);
+      for (const [i, el] of (doc.elements as unknown[]).entries()) {
+        if (el !== null && typeof el === "object" && !Array.isArray(el)) {
+          addEl(`golden:${name} el[${i}]`, el);
+          elementMutants(el as Record<string, unknown>, `golden:${name} el[${i}]`);
+        }
+      }
+    }
+    for (const [name, doc] of SEED_DOCS) {
+      addDoc(`seed:${name}`, doc);
+      docMutants(doc, `seed:${name}`);
+      const els = doc.elements;
+      if (Array.isArray(els)) {
+        for (const [i, el] of els.entries()) {
+          if (el !== null && typeof el === "object" && !Array.isArray(el)) {
+            addEl(`seed:${name} el[${i}]`, el);
+            elementMutants(el as Record<string, unknown>, `seed:${name} el[${i}]`);
+          }
+        }
+      }
+    }
+    for (const [i, v] of VDD_FIELD_VECTORS.entries()) {
+      for (const [tag, doc] of [
+        ["doc", v.doc],
+        ["base", v.base],
+      ] as const) {
+        if (!doc) continue;
+        addDoc(`vector[${i}]:${v.note}:${tag}`, doc);
+        docMutants(doc as unknown as Record<string, unknown>, `vector[${i}]:${tag}`);
+      }
+    }
+    for (const [i, el] of ELEMENT_EXEMPLARS.entries()) {
+      addEl(`exemplar[${i}]`, el);
+      elementMutants(el as Record<string, unknown>, `exemplar[${i}]`);
+    }
+    // non-document top-level shapes
+    for (const [i, v] of [null, undefined, 42, "x", true, [], new Date(0), () => 0, Object.create(null)].entries()) {
+      addDoc(`toplevel#${i}`, v);
+      addEl(`toplevel#${i}`, v);
+    }
+
+    for (const [label, doc] of docCases) checkDoc(doc, `doc:${label}`);
+    for (const [label, el] of elCases) {
+      checkElement(el, `el:${label}`);
+      checkDoc(wrap(el), `wrapped-el:${label}`);
+    }
+
+    // eslint-disable-next-line no-console
+    console.info(
+      `differential cases: ${counts.doc} document + ${counts.element} element ` +
+        `(${counts.accepted} accepted, ${counts.rejected} rejected at doc level; ` +
+        `corpus ${docCases.length} docs, ${elCases.length} elements)`,
+    );
+    // sanity: the corpus actually exercises both branches broadly
+    expect(counts.rejected).toBeGreaterThan(500);
+    expect(counts.accepted).toBeGreaterThan(50);
+    expect(mismatches).toEqual([]);
+  });
+});
