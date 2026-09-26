@@ -9,6 +9,9 @@ hand-copied between `Vibhaga-Admin`, `Vibhaga-Web` and `Vibhaga-API` (see the um
 - ✅ One npm package at the repo root; sources under `src/<module>/`, one `exports`
   subpath per module (`./vdd-schema` today). `dist/` is **committed** — a git dep must
   not need a build step; `check:dist` enforces it.
+- ✅ Consumers pin `"git+https://github.com/DevTuskers/Vibhaga-Shared.git#vX.Y.Z"` —
+  the `github:` shorthand serializes to `git+ssh://`, which needs credentials even for
+  a public repo in anything that takes the URL literally.
 - ✅ **PUBLIC.** Never commit production content, real question data (incl. fixture
   dumps like `live-dsl.json`), or secrets. Synthetic fixtures only.
 - ❌ Not a place for app code, renderers, or React. Types, parsers and pure helpers

@@ -79,9 +79,15 @@ never `#latest`:
 ```jsonc
 // package.json
 "dependencies": {
-  "@vibhaga/shared": "github:DevTuskers/Vibhaga-Shared#v0.1.0"
+  "@vibhaga/shared": "git+https://github.com/DevTuskers/Vibhaga-Shared.git#v0.1.0"
 }
 ```
+
+Use the explicit `git+https://` form, not npm's `github:` shorthand — the shorthand
+serializes to `git+ssh://git@github.com/…`, which needs SSH credentials even for this
+public repo in anything that takes the URL literally (`git` itself, non-npm package
+managers). Write the line into `package.json` directly: `npm install <pkg>@<git+https
+url>` normalizes GitHub URLs back to `github:` on save.
 
 `dist/` is **committed**, so the git dep needs no build step and no `prepare` script.
 Works with Next 16 (bundler resolution), Vitest, wrangler/workerd, and plain Node 24
