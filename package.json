@@ -1,0 +1,31 @@
+{
+  "name": "@vibhaga/shared",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "sideEffects": false,
+  "description": "Shared modules for the Vibhaga umbrella. First module: vdd-schema — the strict Vibhaga Diagram DSL schema + parser (dependency-free).",
+  "exports": {
+    "./vdd-schema": {
+      "types": "./dist/vdd-schema/index.d.ts",
+      "import": "./dist/vdd-schema/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "check:dist": "npm run build && git diff --exit-code dist"
+  },
+  "devDependencies": {
+    "typescript": "5.9.3",
+    "vitest": "4.1.9",
+    "zod": "4.4.3"
+  }
+}
