@@ -3,12 +3,14 @@
  * hand-rolled parser (`src/vdd-schema/parse.ts`) and the test oracle — the byte-verbatim
  * copy of Admin's zod schema (`test/oracle/admin-vdd-zod.ts`, zod 4.4.3). For every input:
  *
- *   1. accept/reject parity:           `result.ok === oracle.success`
- *   2. on success, value equality:     `deepStrictEqual(result.value, oracle.data)`
+ *   1. accept/reject parity:               `result.ok === oracle.success`
+ *   2. on success, value equality:         `deepStrictEqual(result.value, oracle.data)`
  *      (unknown keys stripped at every level, `meta` kept as-is, new object not the input)
- *   3. on failure, path-set equality:  the SET of issue paths is identical (messages may
- *      differ — except PATH_D's, asserted verbatim in parse.test.ts)
- *   4. non-mutation:                   the input is byte-identical after parsing
+ *   3. on failure, path-MULTISET equality: the issue paths match as a multiset — same
+ *      paths AND same counts per path (catches zod's one-issue-per-field rules).
+ *      Symbol segments are normalized with `String(sym)` on both sides (VddIssue.path
+ *      is `(string|number)[]`; zod's real path carries the symbol — see parse.ts `rec`).
+ *   4. non-mutation:                       the input is byte-identical after parsing
  *
  * All four must hold for 100% of cases. The suite is deterministic — no randomness at all.
  */
@@ -38,11 +40,15 @@ type Mismatch = {
 const mismatches: Mismatch[] = [];
 const counts = { doc: 0, element: 0, accepted: 0, rejected: 0 };
 
-const pathSet = (issues: readonly { path: readonly PropertyKey[] }[]): Set<string> =>
-  new Set(issues.map((i) => JSON.stringify(i.path)));
-
-const setEq = (a: Set<string>, b: Set<string>): boolean =>
-  a.size === b.size && [...a].every((x) => b.has(x));
+/**
+ * Multiset of issue paths, JSON-encoded and sorted. Symbol path segments (which zod
+ * emits verbatim inside `meta` record failures) are normalized to `String(sym)` so
+ * they compare against the parser's documented `String(sym)` emission.
+ */
+const pathMultiset = (issues: readonly { path: readonly PropertyKey[] }[]): string[] =>
+  issues
+    .map((i) => JSON.stringify(i.path.map((s) => (typeof s === "symbol" ? String(s) : s))))
+    .sort();
 
 function compare<T>(
   label: string,
@@ -73,13 +79,13 @@ function compare<T>(
       });
     }
   } else {
-    const mp = pathSet(mine.errors);
-    const op = pathSet(oracle.error!.issues);
-    if (!setEq(mp, op)) {
+    const mp = pathMultiset(mine.errors);
+    const op = pathMultiset(oracle.error!.issues);
+    if (JSON.stringify(mp) !== JSON.stringify(op)) {
       mismatches.push({
         label,
         kind: "paths",
-        detail: `mine=${JSON.stringify([...mp].sort())} oracle=${JSON.stringify([...op].sort())} input=${inputSnapshot.slice(0, 300)}`,
+        detail: `mine=${JSON.stringify(mp)} oracle=${JSON.stringify(op)} input=${inputSnapshot.slice(0, 300)}`,
       });
     }
   }
@@ -403,6 +409,132 @@ describe("differential: package parser vs Admin zod oracle", () => {
     for (const [i, v] of [null, undefined, 42, "x", true, [], new Date(0), () => 0, Object.create(null)].entries()) {
       addDoc(`toplevel#${i}`, v);
       addEl(`toplevel#${i}`, v);
+    }
+
+    /* ── critique R1 case classes (F5) ─────────────────────────────────────────
+     * The classes the committed generator used to miss, found by the independent
+     * probe: `in`-semantics field presence, asymmetric tuple item validation,
+     * record symbol keys, int() type-level short-circuit. Deterministic only —
+     * stateful getters/Proxies are excluded (each impl would see a different read). */
+
+    // F1: `in`-semantics — fields supplied by prototype, getter, or Proxy `has` trap
+    addDoc("r1:doc-fields-on-proto", Object.assign(
+      Object.create({ schema: "vibhaga.diagram", schemaVersion: 1 }),
+      { canvas: { width: 1, height: 1 }, elements: [] },
+    ));
+    addEl("r1:el-fields-on-proto", Object.assign(
+      Object.create({ id: "e", type: "circle" }),
+      { center: [0, 0], r: 1 },
+    ));
+    addDoc("r1:proto-wrong-type-field", Object.assign(
+      Object.create({ schema: "vibhaga.diagram", schemaVersion: "one" }),
+      { canvas: { width: 1, height: 1 }, elements: [] },
+    ));
+    class ClassEl { id = "e"; type = "rect"; x = 1; y = 2; width = 3; height = 4; }
+    class GetterEl { id = "e"; get type() { return "circle" as const; } get center() { return [0, 0]; } get r() { return 1; } }
+    addDoc("r1:class-instance-element", wrap(new ClassEl()));
+    addEl("r1:getter-fields-element", new GetterEl());
+    addDoc("r1:proxy-passthrough", new Proxy({
+      schema: "vibhaga.diagram", schemaVersion: 1, canvas: { width: 1, height: 1 }, elements: [],
+    }, {}));
+    addDoc("r1:proxy-has-hides-canvas", new Proxy({
+      schema: "vibhaga.diagram", schemaVersion: 1, canvas: { width: 1, height: 1 }, elements: [],
+    }, { has: (t, p) => (p === "canvas" ? false : Reflect.has(t, p)) }));
+    addDoc("r1:proto-getter-canvas", {
+      schema: "vibhaga.diagram", schemaVersion: 1, elements: [],
+      get canvas() { return { width: 1, height: 1 }; },
+    });
+
+    // F2: tuple length × item errors (asymmetric zod semantics)
+    addEl("r2:line.points-long-baditem", { id: "e", type: "line", points: [["x", 0], [1, 1], [2, 2]] });
+    addEl("r2:line.points-long-okitems", { id: "e", type: "line", points: [[0, 0], [1, 1], [2, 2]] });
+    addEl("r2:line.points-short-baditem", { id: "e", type: "line", points: [["x", 0]] });
+    addEl("r2:line.points-short-okitem", { id: "e", type: "line", points: [[0, 0]] });
+    addEl("r2:tickmark.on-long-baditem", { id: "e", type: "tickMark", on: [[0, 0], ["x", 1], [2, 2]] });
+    addEl("r2:tickmark.on-short", { id: "e", type: "tickMark", on: [[0, 0]] });
+    addEl("r2:point.at-long-baditem", { id: "e", type: "point", at: ["x", 0, 5] });
+    addEl("r2:point.at-short", { id: "e", type: "point", at: [0] });
+    addEl("r2:point.at-empty", { id: "e", type: "point", at: [] });
+    addDoc("r2:wrapped-tuple-mutants", wrap({ id: "e", type: "line", points: [["x", 0], [1, 1], [2, 2]] }));
+
+    // F3: enumerable symbol keys — inside `meta` (record → reject) vs unknown doc/element keys (stripped → accept)
+    const symKey = Symbol("critique");
+    addDoc("r3:meta-symbol-key", {
+      schema: "vibhaga.diagram", schemaVersion: 1, canvas: { width: 1, height: 1 },
+      elements: [], meta: { [symKey]: 1, a: 2 },
+    });
+    addDoc("r3:doc-symbol-unknown-key", {
+      schema: "vibhaga.diagram", schemaVersion: 1, canvas: { width: 1, height: 1 },
+      elements: [], [symKey]: 1,
+    } as Record<string, unknown>);
+    addEl("r3:element-symbol-unknown-key", { id: "e", type: "circle", center: [0, 0], r: 1, [symKey]: 9 } as unknown as Record<string, unknown>);
+    {
+      const nonEnum = { a: 1 };
+      Object.defineProperty(nonEnum, Symbol("hidden"), { value: 1, enumerable: false });
+      addDoc("r3:meta-nonenum-symbol", {
+        schema: "vibhaga.diagram", schemaVersion: 1, canvas: { width: 1, height: 1 },
+        elements: [], meta: nonEnum,
+      });
+    }
+
+    // F4: int() is type-level — int failure emits ONE issue (min/max skipped)
+    addEl("r4:angleMark.arcs=0.3", { id: "e", type: "angleMark", vertex: [0, 0], from: [1, 0], to: [0, 1], r: 5, arcs: 0.3 });
+    addEl("r4:angleMark.arcs=5e-324", { id: "e", type: "angleMark", vertex: [0, 0], from: [1, 0], to: [0, 1], r: 5, arcs: 5e-324 });
+    addEl("r4:angleMark.arcs=0.30000000000000004", { id: "e", type: "angleMark", vertex: [0, 0], from: [1, 0], to: [0, 1], r: 5, arcs: 0.1 + 0.2 });
+    addEl("r4:tickMark.count=0.5", { id: "e", type: "tickMark", on: [[0, 0], [1, 1]], count: 0.5 });
+    addDoc("r4:schemaVersion=0.5", { schema: "vibhaga.diagram", schemaVersion: 0.5, canvas: { width: 1, height: 1 }, elements: [] });
+
+    // nested multi-fault — issue aggregation across several fields/levels
+    addDoc("r5:nested-multi-fault", {
+      schema: "vibhaga.diagram",
+      schemaVersion: 1.5,
+      canvas: { width: -1, height: "x" },
+      defaults: { opacity: 9, fontFamily: "Comic Sans" },
+      elements: [
+        { id: "a", type: "rect", x: 0, y: 0, width: "w", height: 5, stroke: { width: "wide", style: "bogus" } },
+        { type: "bogus" },
+      ],
+      a11y: { title: 42 },
+    });
+
+    // sparse arrays / holes
+    addDoc("r5:elements-sparse-Array(3)", { schema: "vibhaga.diagram", schemaVersion: 1, canvas: { width: 1, height: 1 }, elements: new Array(3) });
+    addDoc("r5:elements-hole", { schema: "vibhaga.diagram", schemaVersion: 1, canvas: { width: 1, height: 1 }, elements: [{ id: "a", type: "circle", center: [0, 0], r: 1 }, , { id: "b", type: "circle", center: [0, 0], r: 1 }] });
+    addEl("r5:points-hole", { id: "e", type: "line", points: [[0, 0], ,] });
+
+    // null-prototype objects
+    addDoc("r5:nullproto-doc", Object.assign(Object.create(null), {
+      schema: "vibhaga.diagram", schemaVersion: 1, canvas: { width: 1, height: 1 }, elements: [],
+    }));
+    addDoc("r5:nullproto-meta", {
+      schema: "vibhaga.diagram", schemaVersion: 1, canvas: { width: 1, height: 1 },
+      elements: [], meta: Object.assign(Object.create(null), { a: 1 }),
+    });
+    addEl("r5:nullproto-element", Object.assign(Object.create(null), { id: "e", type: "circle", center: [0, 0], r: 1 }));
+
+    // numeric boundaries in int/number slots (the committed NUMERIC_BAD covers most;
+    // these pin the specific boundary values called out in the critique)
+    for (const [tag, v] of [["-0", -0], ["1e308", 1e308], ["5e-324", 5e-324], ["MSI", Number.MAX_SAFE_INTEGER], ["MSI+1", Number.MAX_SAFE_INTEGER + 1], ["MIN-SAFE-1", Number.MIN_SAFE_INTEGER - 1]] as const) {
+      addDoc(`r5:schemaVersion=${tag}`, { schema: "vibhaga.diagram", schemaVersion: v, canvas: { width: 1, height: 1 }, elements: [] });
+      addEl(`r5:z=${tag}`, { id: "e", type: "circle", center: [0, 0], r: 1, z: v });
+    }
+    addDoc("r5:canvas-extreme-floats", { schema: "vibhaga.diagram", schemaVersion: 1, canvas: { width: 1e308, height: 5e-324 }, elements: [] });
+    addEl("r5:duplicate-points", { id: "e", type: "polygon", points: [[1, 1], [1, 1], [1, 1]] });
+
+    // frozen inputs — parse must not mutate and must not throw
+    {
+      const freeze = (o: unknown): unknown => {
+        if (o && typeof o === "object") {
+          for (const v of Object.values(o)) freeze(v);
+          Object.freeze(o);
+        }
+        return o;
+      };
+      addDoc("r5:deep-frozen-doc", freeze({
+        schema: "vibhaga.diagram", schemaVersion: 1,
+        canvas: { width: 10, height: 10 },
+        elements: [{ id: "e", type: "circle", center: [0, 0], r: 1, junk: 1 }],
+      }));
     }
 
     for (const [label, doc] of docCases) checkDoc(doc, `doc:${label}`);

@@ -9,7 +9,9 @@
  *
  * Semantics mirrored from zod 4 (measured, not assumed):
  *   - `number()` rejects NaN, ±Infinity, BigInt, non-numbers.
- *   - `int()` is a SAFE-integer check (2**53 rejects).
+ *   - `int()` is zod's `safeint`: `Number.isInteger` at type level (failure skips the
+ *     check stage), plus an implicit ±MAX_SAFE_INTEGER range check that runs as a
+ *     normal value check next to any user `min`/`max`.
  *   - tuples are exact-length; `array().min(n)` fails at the array's own path.
  *   - the discriminated union on `type` reports ONE issue at `["type"]` when the
  *     discriminator is missing/invalid, otherwise the chosen member's issues verbatim.
@@ -37,10 +39,23 @@ const num = (opts = {}) => (v, path, ctx) => {
     if (typeof v !== "number" || !Number.isFinite(v)) {
         return fail(ctx, path, "expected a number");
     }
+    // zod 4's `.int()` is `safeint`: `Number.isInteger` at TYPE level (failure skips
+    // the check stage — one invalid_type), then an implicit ±MAX_SAFE_INTEGER range
+    // check that runs as a NORMAL check alongside any user min/max — so an unsafe
+    // integer below min() earns two issues (`-2**53` on `int().min(1)` → 2 too_small).
+    if (opts.int && !Number.isInteger(v)) {
+        return fail(ctx, path, "expected an integer");
+    }
     let ok = true;
-    if (opts.int && !Number.isSafeInteger(v)) {
-        fail(ctx, path, "expected an integer");
-        ok = false;
+    if (opts.int) {
+        if (v < -Number.MAX_SAFE_INTEGER) {
+            fail(ctx, path, "expected an integer >= -9007199254740991 (safe integer range)");
+            ok = false;
+        }
+        if (v > Number.MAX_SAFE_INTEGER) {
+            fail(ctx, path, "expected an integer <= 9007199254740991 (safe integer range)");
+            ok = false;
+        }
     }
     if (opts.min !== undefined) {
         const bad = opts.minExclusive ? v <= opts.min : v < opts.min;
@@ -56,8 +71,16 @@ const num = (opts = {}) => (v, path, ctx) => {
     return ok ? v : BAD;
 };
 const str = (opts = {}) => (v, path, ctx) => {
-    if (typeof v !== "string")
-        return fail(ctx, path, "expected a string");
+    if (typeof v !== "string") {
+        // zod's length check is "sizable"-gated, not type-gated: a non-string with a
+        // numeric `.length` violating the bound still earns the too_small issue on
+        // top of invalid_type (`id: []` → both; `id: 42` → invalid_type only).
+        fail(ctx, path, "expected a string");
+        if (opts.minLen !== undefined && typeof v?.length === "number" && v.length < opts.minLen) {
+            fail(ctx, path, `expected a string of at least ${opts.minLen} characters`);
+        }
+        return BAD;
+    }
     let ok = true;
     if (opts.minLen !== undefined && v.length < opts.minLen) {
         fail(ctx, path, `expected a string of at least ${opts.minLen} characters`);
@@ -83,7 +106,10 @@ const obj = (fields) => (v, path, ctx) => {
     const out = {};
     let ok = true;
     for (const [key, check, required] of fields) {
-        if (!Object.prototype.hasOwnProperty.call(v, key)) {
+        // zod's presence test is `in`-semantics, not hasOwnProperty: inherited,
+        // getter and Proxy `has`-trapped fields count as present and are read
+        // through normal property access (proto getters fire, `has` traps rule).
+        if (!(key in v)) {
             if (required) {
                 fail(ctx, [...path, key], "missing required field");
                 ok = false;
@@ -114,11 +140,18 @@ const obj = (fields) => (v, path, ctx) => {
 const tup = (items) => (v, path, ctx) => {
     if (!Array.isArray(v))
         return fail(ctx, path, `expected a ${items.length}-item tuple`);
-    if (v.length !== items.length) {
+    let ok = true;
+    // zod's length check is asymmetric: too-SHORT reports only the length issue
+    // (items are not validated); too-LONG reports the length issue AND validates
+    // items at indices 0..expected-1. Equal length validates every item.
+    if (v.length < items.length) {
         return fail(ctx, path, `expected a ${items.length}-item tuple, got ${v.length}`);
     }
+    if (v.length > items.length) {
+        fail(ctx, path, `expected a ${items.length}-item tuple, got ${v.length}`);
+        ok = false;
+    }
     const out = [];
-    let ok = true;
     for (let i = 0; i < items.length; i++) {
         const parsed = items[i](v[i], [...path, i], ctx);
         if (parsed === BAD)
@@ -129,8 +162,15 @@ const tup = (items) => (v, path, ctx) => {
     return ok ? out : BAD;
 };
 const arr = (item, min) => (v, path, ctx) => {
-    if (!Array.isArray(v))
-        return fail(ctx, path, "expected an array");
+    if (!Array.isArray(v)) {
+        // same sizable-gated length check as zod: `"x"` (length 1) on `min(2)` gets
+        // invalid_type + too_small; `42` gets invalid_type only.
+        fail(ctx, path, "expected an array");
+        if (min !== undefined && typeof v?.length === "number" && v.length < min) {
+            fail(ctx, path, `expected an array of at least ${min} items`);
+        }
+        return BAD;
+    }
     let ok = true;
     if (min !== undefined && v.length < min) {
         fail(ctx, path, `expected an array of at least ${min} items`);
@@ -156,6 +196,20 @@ const isRecordInput = (v) => isPlainObjectInput(v) &&
 const rec = (v, path, ctx) => {
     if (!isRecordInput(v))
         return fail(ctx, path, "expected a record (plain object)");
+    // zod's record runs every enumerable own KEY through the string() key schema:
+    // an enumerable symbol key fails it and voids the record (`invalid_key` at
+    // [.., <symbol>]). `VddIssue.path` is `(string|number)[]`, so the symbol path
+    // segment is emitted as `String(sym)` — e.g. "Symbol(s)" — documented because
+    // it is the one path segment that is not a real property key.
+    for (const sym of Object.getOwnPropertySymbols(v)) {
+        if (Object.getOwnPropertyDescriptor(v, sym).enumerable) {
+            ctx.issues.push({
+                path: [...path, String(sym)],
+                message: `${dotted(path, ctx.root)}: symbol keys are not allowed in a record`,
+            });
+            return BAD;
+        }
+    }
     // zod's copy drops `__proto__` wholesale (an own `__proto__` key on the input — only
     // producible via JSON.parse — survives into neither the output's own keys nor its
     // prototype), keeps every other string key, and keeps values by reference.

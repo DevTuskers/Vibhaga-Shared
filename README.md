@@ -36,17 +36,27 @@ import {
 #### Strict semantics — one parser, no lenient mode
 
 `parseVddDocument`/`parseVddElement` are **behaviourally identical** to Admin's former
-zod-4 schema (`test/oracle/admin-vdd-zod.ts` is a byte-verbatim copy pinned to a git sha,
-and `test/differential.test.ts` proves equivalence on ~13k generated cases):
+zod-4.4.3 schema — identical accept/reject, output, and issue paths (multiset) vs the
+zod 4.4.3 oracle on the differential suite (`test/oracle/admin-vdd-zod.ts` is a
+byte-verbatim copy pinned to a git sha; `test/differential.test.ts` runs ~13k fixture +
+generated cases through both):
 
 - same accept/reject on every input;
 - on success the output deep-equals zod's: **unknown keys stripped at every object
   level**, `meta` record values kept as-is, a new object — never the input;
-- on failure `errors` reports **every** issue with zod-style paths addressing the
+- on failure `errors` reports every issue with zod-style paths addressing the
   element, e.g. `["elements", 3, "stroke", "width"]` — messages name the field in
   plain English (`path.d`'s regex message is kept verbatim);
-- `number()` rejects NaN/±Infinity; `int()` is safe-integer; tuples are exact length;
-  `type` is a discriminated union; optional-vs-`undefined` matches zod.
+- `number()` rejects NaN/±Infinity; `int()` mirrors zod's `safeint` (a type-level
+  `Number.isInteger` that skips the check stage, plus an implicit safe-range check
+  that reports alongside `min`/`max`); tuples are exact length (too-short
+  reports only the length issue; too-long also validates items 0..expected−1, matching
+  zod); `type` is a discriminated union; optional-vs-`undefined` and `in`-semantics
+  field presence (prototype/getter/Proxy fields) match zod;
+- **one documented path-shape exception:** inside `meta`, an enumerable *symbol* key
+  fails the record as zod's does, but `VddIssue.path` is `(string|number)[]`, so the
+  symbol segment is emitted as `String(sym)` (e.g. `["meta","Symbol(x)"]`) rather than
+  the symbol itself.
 
 Paint safety is **not** a schema rule: hostile colours parse fine (the figure must still
 draw) and are refused at the render boundary by `safeColor`/`safeCanvasBackground`;

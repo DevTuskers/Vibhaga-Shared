@@ -9,7 +9,9 @@
  *
  * Semantics mirrored from zod 4 (measured, not assumed):
  *   - `number()` rejects NaN, ±Infinity, BigInt, non-numbers.
- *   - `int()` is a SAFE-integer check (2**53 rejects).
+ *   - `int()` is zod's `safeint`: `Number.isInteger` at type level (failure skips the
+ *     check stage), plus an implicit ±MAX_SAFE_INTEGER range check that runs as a
+ *     normal value check next to any user `min`/`max`.
  *   - tuples are exact-length; `array().min(n)` fails at the array's own path.
  *   - the discriminated union on `type` reports ONE issue at `["type"]` when the
  *     discriminator is missing/invalid, otherwise the chosen member's issues verbatim.
